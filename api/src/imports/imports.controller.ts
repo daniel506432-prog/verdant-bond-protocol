@@ -1,135 +1,72 @@
 import {
-  BadRequestException,
   Body,
-  ConflictException,
   Controller,
   Get,
-  GoneException,
-  NotFoundException,
+  HttpCode,
+  HttpStatus,
   Param,
   Post,
-  Query,
   Req,
-  ServiceUnavailableException,
   UseGuards,
 } from '@nestjs/common';
-import { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface';
+import { ApiTags } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
-import { AdminGuard } from '../common/guards/admin.guard';
-import { ImportBatch, ImportFormat, ImportTraceEntry, PreviewRow } from './import.interface';
-import { ImportPipelineError, ImportPipelineService } from './import-pipeline.service';
+import { AuthenticatedRequest } from '../common/interfaces/authenticated-request.interface';
+import { IMPORT_ADMIN_ROLE, ImportOperationView, ImportsService } from './imports.service';
+import { StartImportDto } from './dto/start-import.dto';
 
-/** Map pipeline refusals to 4xx/503 rather than a 500. */
-function toHttpError(error: unknown): never {
-  if (error instanceof ImportPipelineError) {
-    switch (error.code) {
-      case 'NOT_FOUND':
-        throw new NotFoundException(error.message);
-      case 'INVALID_REQUEST':
-        throw new BadRequestException(error.message);
-      case 'PREVIEW_EXPIRED':
-        throw new GoneException(error.message);
-      case 'DISABLED':
-      case 'CAPACITY':
-        throw new ServiceUnavailableException(error.message);
-      default:
-        throw new ConflictException({ message: error.message, code: error.code });
-    }
-  }
-  throw error;
-}
-
-async function run<T>(fn: () => T | Promise<T>): Promise<T> {
-  try {
-    return await fn();
-  } catch (error) {
-    toHttpError(error);
-  }
-}
-
-/**
- * Secure import pipeline API. Admin-only: an import writes compliance state
- * (KYC) for many investors at once. See docs/import-pipeline.md.
- */
-@Controller('api/v1/imports')
-@UseGuards(JwtAuthGuard, AdminGuard)
+@ApiTags('imports')
+@Controller('api/v1/imports/operations')
+@UseGuards(JwtAuthGuard)
 export class ImportsController {
-  constructor(private readonly imports: ImportPipelineService) {}
+  constructor(private readonly imports: ImportsService) {}
 
-  @Get('kinds')
-  kinds() {
-    return this.imports.kinds();
+  /** Start a long-running import. Responds once the import completes or is cancelled. */
+  @Post()
+  @HttpCode(HttpStatus.ACCEPTED)
+  start(@Body() dto: StartImportDto, @Req() req: AuthenticatedRequest): Promise<ImportOperationView> {
+    return this.imports.startImport(this.userId(req), dto.rows, { chunkSize: dto.chunkSize });
   }
 
   @Get()
-  list() {
-    return this.imports.list();
+  list(@Req() req: AuthenticatedRequest): ImportOperationView[] {
+    return this.imports.listImports();
   }
 
-  /** Every import that wrote to one record (e.g. an investor address). */
-  @Get('trace')
-  trace(@Query('key') key?: string): Promise<ImportTraceEntry[]> {
-    return run(() => {
-      if (!key) throw new ImportPipelineError('INVALID_REQUEST', 'key query parameter is required');
-      return this.imports.traceForKey(key);
-    });
+  @Get(':operationId')
+  get(@Param('operationId') operationId: string): ImportOperationView {
+    return this.imports.getImport(operationId);
   }
 
-  @Post(':kind/preview')
-  preview(
-    @Param('kind') kind: string,
-    @Body() body: { format?: ImportFormat; rows?: unknown; csv?: unknown; sourceName?: string },
+  /** Request cancellation. Idempotent; safe to call after completion. */
+  @Post(':operationId/cancel')
+  @HttpCode(HttpStatus.OK)
+  cancel(
+    @Param('operationId') operationId: string,
     @Req() req: AuthenticatedRequest,
-  ): Promise<ImportBatch> {
-    return run(() =>
-      this.imports.preview({
-        kind,
-        format: body?.format ?? (typeof body?.csv === 'string' ? 'csv' : 'json'),
-        rows: body?.rows,
-        csv: body?.csv,
-        sourceName: typeof body?.sourceName === 'string' ? body.sourceName.slice(0, 200) : null,
-        actor: req.user.walletAddress,
-      }),
-    );
+  ): ImportOperationView {
+    return this.imports.cancelImport(operationId, this.actor(req));
   }
 
-  @Get(':id')
-  get(@Param('id') id: string): Promise<ImportBatch> {
-    return run(() => this.imports.get(id));
-  }
-
-  @Get(':id/quarantine')
-  quarantine(@Param('id') id: string): Promise<PreviewRow[]> {
-    return run(() => this.imports.quarantined(id));
-  }
-
-  /** Commit, or resume a partially_committed batch (the retry path). */
-  @Post(':id/commit')
-  commit(
-    @Param('id') id: string,
-    @Body() body: { previewHash?: string; allowDuplicate?: boolean },
+  /** Retry a cancelled or failed import. */
+  @Post(':operationId/retry')
+  @HttpCode(HttpStatus.ACCEPTED)
+  retry(
+    @Param('operationId') operationId: string,
     @Req() req: AuthenticatedRequest,
-  ): Promise<ImportBatch> {
-    return run(() =>
-      this.imports.commit(id, {
-        previewHash: body?.previewHash ?? '',
-        allowDuplicate: body?.allowDuplicate === true,
-        actor: req.user.walletAddress,
-      }),
-    );
+  ): Promise<ImportOperationView> {
+    return this.imports.retryImport(operationId, this.actor(req));
   }
 
-  @Post(':id/rollback')
-  rollback(
-    @Param('id') id: string,
-    @Body() body: { previewHash?: string },
-    @Req() req: AuthenticatedRequest,
-  ): Promise<ImportBatch> {
-    return run(() => this.imports.rollback(id, { previewHash: body?.previewHash ?? '', actor: req.user.walletAddress }));
+  private actor(req: AuthenticatedRequest): { userId: string; role?: string } {
+    const roles = req.user?.roles ?? [];
+    return {
+      userId: this.userId(req),
+      role: roles.includes(IMPORT_ADMIN_ROLE) ? IMPORT_ADMIN_ROLE : roles[0],
+    };
   }
 
-  @Post(':id/discard')
-  discard(@Param('id') id: string, @Req() req: AuthenticatedRequest): Promise<ImportBatch> {
-    return run(() => this.imports.discard(id, req.user.walletAddress));
+  private userId(req: AuthenticatedRequest): string {
+    return req.user?.walletAddress ?? 'anonymous';
   }
 }
